@@ -3,6 +3,10 @@ import json
 import random
 import conllu
 from glob import glob
+import math
+import pandas as pd
+import numpy as np
+from numpy.random import choice
 
 from models import *
 from mlt import *
@@ -22,11 +26,44 @@ from seqeval.metrics import precision_score as seq_precision_score
 from seqeval.metrics import recall_score as seq_recall_score
 
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+import matplotlib.pyplot as plt
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
                     level = logging.INFO)
 logger = logging.getLogger(__name__)
+
+def normalize_loss(loss):
+    min_loss = 0
+    max_loss = 2.5
+    if(loss > max_loss):
+        logger.warning(f"Exp3 loss is bigger than max: {loss}")
+        return 1
+
+    return (loss - min_loss) / (max_loss - min_loss)
+
+# draw: [float] -> int
+# pick an index from the given list of floats proportionally
+# to the size of the entry (i.e. normalize to a probability
+# distribution and draw according to the probabilities).
+def draw(weights):
+    choice = random.uniform(0, sum(weights))
+    choiceIndex = 0
+
+    for weight in weights:
+        choice -= weight
+        if choice <= 0:
+            return choiceIndex
+
+        choiceIndex += 1
+
+# distr: [float] -> (float)
+# Normalize a list of floats to a probability distribution.  Gamma is an
+# egalitarianism factor, which tempers the distribtuion toward being uniform as
+# it grows from zero to one.
+def distr(weights, gamma=0.0):
+    theSum = float(sum(weights))
+    return tuple((1.0 - gamma) * (w / theSum) + (gamma / len(weights)) for w in weights)
 
 
 class InputExample(object):
@@ -228,7 +265,7 @@ class SentClassProcessor(DataProcessor):
             sents.append((sent, label))
         return sents
 
-    def get_train_examples(self, data_dir, lang):
+    def get_train_examples(self, datea_dir, lang):
         """See base class."""
         file = os.path.join(data_dir, f"{lang}", "*.train.json")
         file = glob(file)[0]
@@ -755,7 +792,7 @@ def main():
             # not used by gold_all
             train_s_data = train_t_data
             #read_data(args.data_dir, processor, tokenizer, tgt_lang, 'train', args.max_seq_length, args.train_size, seed=args.seed)
-        elif args.method == 'metawt_multi':
+        elif args.method == 'metawt_multi' or args.method == "metaxl":
             train_s_data = []
             train_t_data = read_data(args.data_dir, processor, tokenizer, tgt_lang, 'train', args.max_seq_length, args.bert_model, args.bert_model_type, args.target_train_size, seed=args.data_seed)
             # dev all also needs to subsample
@@ -793,8 +830,8 @@ def main():
             batch_size = int(args.batch_size / int(os.environ['NGPU']))
 
         train_t_loader = DataIterator(DataLoader(train_t_data, sampler=train_t_sampler, batch_size=batch_size, shuffle=(train_t_sampler is None)))
-        if args.method == 'metawt_multi': # this only supports single GPU mode
-            train_s_loaders = [DataLoader(train_s_data[i], sampler=None, batch_size=batch_size, shuffle=True) for i in range(len(src_langs))]
+        if args.method == 'metawt_multi' or args.method == "metaxl": # this only supports single GPU mode
+            train_s_loaders = [DataIterator(DataLoader(train_s_data[i], sampler=None, batch_size=batch_size, shuffle=True)) for i in range(len(src_langs))]
         elif args.method == "metawt" or args.method == "metaxl" or args.method == "jt-metaxl"  or args.method == "joint_training":
             train_s_loaders = [DataLoader(train_s_data, sampler=train_s_sampler, batch_size=batch_size, shuffle=(train_s_sampler is None))]
         dev_loader = DataIterator(DataLoader(dev_data, sampler=dev_sampler, batch_size=batch_size, shuffle=(dev_sampler is None)))
@@ -956,176 +993,218 @@ def main():
         best_val_metric = float('inf')
         model.train()
 
-        for epoch in trange(int(args.epochs), desc="Epoch"):
+        #for epoch in trange(int(args.epochs), desc="Epoch"):
 
-            if args.method == "gold_only":
-                for step, batch_train_t in enumerate(tqdm(train_t_loader.loader, desc="Iteration")):
-                    batch_train_t = tuple(t.to(device) for t in batch_train_t)  # tgt train
+        if args.method == "gold_only":
+            for step, batch_train_t in enumerate(tqdm(train_t_loader.loader, desc="Iteration")):
+                batch_train_t = tuple(t.to(device) for t in batch_train_t)  # tgt train
 
-                    train_t_ids, train_t_mask, train_t_labels = batch_train_t
-                    train_t_ids, train_t_mask, train_t_labels = trim_input(train_t_ids, train_t_mask, train_t_labels, args.train_max_seq_length)
+                train_t_ids, train_t_mask, train_t_labels = batch_train_t
+                train_t_ids, train_t_mask, train_t_labels = trim_input(train_t_ids, train_t_mask, train_t_labels, args.train_max_seq_length)
 
-                    if len(train_t_ids) == 1:
+                if len(train_t_ids) == 1:
+                    continue
+
+                if args.augcopy > 0:
+                    train_t_ids, train_t_mask, train_t_labels = permute_aug(train_t_ids, train_t_mask, train_t_labels, args.augcopy)
+
+
+                loss_meta, loss_train = step_gold_only(model, optimizer,
+                                                       train_t_ids, train_t_mask, train_t_labels,
+                                                       args)
+                if step % args.every == 0 and args.local_rank <= 0:  # only do eval on first GPU
+                        tqdm.write('Step:%d\tLoss_Meta:%.6f\tLoss_Train:%.6f' % (step, (loss_meta).item(), (loss_train).item()))
+                scheduler.step()
+        else:
+            # *** 1. initialize uniform lang weights
+            source_langs_num = len(src_langs)
+            logger.info(f"Languages number = {source_langs_num}")
+
+            weights = [1.0] * source_langs_num
+            gamma = 0.01
+            src_data_size = args.train_size
+            max_step_size = args.epochs * src_data_size
+            eval_every = 250
+            loss_meta_before = float("inf")
+            # *** 2. initialize batch queues
+            # Maybe nothing to do
+            
+            # *** 3. while top-k or top-p choose language by lang distribution - remember to clear empty queues and update probs
+            # *** update : we currently chose to use max_step_size
+            
+            for step in (tqdm(np.arange(1, max_step_size + 1))):
+                logger.info(f"Step = {step}")
+
+            #for j, train_s_loader in enumerate(train_s_loaders): # note here
+                # *** Choosing a language
+                probability_distribution = distr(weights, gamma)
+                lang_index = draw(probability_distribution)
+                logger.info(f"Chosen language index = {lang_index}")
+                logger.info(f"Updating on language {src_langs[lang_index]} with probability: {probability_distribution[lang_index]}")
+                
+                train_s_loader = train_s_loaders[lang_index]
+                batch_train_s = next(train_s_loader) # check if er need iterator for that
+
+                logger.info(f"Updating on language {src_langs[lang_index]} with probability: {probability_distribution[lang_index]}")
+                logger.info(f"Training batch size = {batch_size}")
+                
+                #   for step, batch_train_s in enumerate(tqdm(train_s_loader, desc="Iteration")): # count epoch based on merged src langs loader
+                batch_train_t = next(train_t_loader)
+
+                batch_train_s = tuple(t.to(device) for t in batch_train_s) # src train
+                batch_train_t = tuple(t.to(device) for t in batch_train_t) # tgt train
+
+                train_s_ids, train_s_mask, train_s_labels = batch_train_s
+                
+                train_s_ids, train_s_mask, train_s_labels = trim_input(train_s_ids, train_s_mask, train_s_labels, args.train_max_seq_length)
+                # print(train_s_labels)
+
+                train_t_ids, train_t_mask, train_t_labels = batch_train_t
+                train_t_ids, train_t_mask, train_t_labels = trim_input(train_t_ids, train_t_mask, train_t_labels, args.train_max_seq_length)
+
+                eta = scheduler.get_last_lr()[0]
+
+
+                # print("*"*20, "source", "*"*20)
+                # print(train_s_ids.shape, train_s_labels.shape)
+                # print("*" * 20, "target", "*" * 20)
+                # print(train_t_ids.shape, train_t_labels.shape)
+
+                if args.method == "metaxl":
+                    half = int(len(train_t_ids)/args.portion)
+                    eval_ids, eval_mask, eval_labels = train_t_ids[half:], train_t_mask[half:], train_t_labels[half:]
+                    train_t_ids, train_t_mask, train_t_labels = train_t_ids[:half], train_t_mask[:half], train_t_labels[:half]
+                    if len(eval_ids) == 0 or len(train_t_ids) == 0:
                         continue
 
-                    if args.augcopy > 0:
-                        train_t_ids, train_t_mask, train_t_labels = permute_aug(train_t_ids, train_t_mask, train_t_labels, args.augcopy)
+                    print("*"*20, "source", "*"*20)
+                    print(eval_ids.shape, eval_labels.shape)
+                    print("*" * 20, "target", "*" * 20)
+                    print(train_t_ids.shape, train_t_labels.shape)
+
+                    layers = [int(l) for l in layers]
+                    loss_meta, loss_train = step_metaxl(model, optimizer,
+                                                            raptors, meta_opt,
+                                                            reweighting_module, reweighting_opt,
+                                                            train_s_ids, train_s_mask, train_s_labels,
+                                                            train_t_ids, train_t_mask, train_t_labels,
+                                                            eval_ids, eval_mask, eval_labels,
+                                                            j if args.meta_per_lang else 0, layers, eta, args)
+                    # *** update here distribution by loss_meta using exp3
+                    exp3_loss = normalize_loss(loss_meta)
+                    #exp3_loss = 1 if loss_meta >= loss_meta_before else 0
+                    loss_meta_before = loss_meta
+                    estimated_loss = 1.0 * exp3_loss / probability_distribution[lang_index]
+                    weights[lang_index] *= math.exp(1.0 * estimated_loss * gamma / source_langs_num)
+                    logger.info(f"Exp3 loss: {exp3_loss}")
+                    #logger.info(f"New weight for lang {src_langs[lang_index]} = {weights[lang_index]}")
+                    logger.info(f"New lang distribution {distr(weights, gamma)} for source langauges: {src_langs}")
+
+                    # logger.info(raptors.nets[0][0].weight)
+                    # logger.info(meta_opt)
+                    # logger.info(optimizer)
+                elif args.method == "jt-metaxl":
+                    layers = [int(l) for l in layers]
+                    loss_meta, loss_train = step_jt_metaxl(model, optimizer,
+                                                            raptors, meta_opt,
+                                                            reweighting_module, reweighting_opt,
+                                                            train_s_ids, train_s_mask, train_s_labels,
+                                                            train_t_ids, train_t_mask, train_t_labels,
+                                                            j if args.meta_per_lang else 0, layers, eta, args)
+
+                elif args.method == 'metawt':
+                    half = int(len(train_t_ids) / 2)
+                    eval_ids, eval_mask, eval_labels = train_t_ids[half:], train_t_mask[half:], train_t_labels[
+                                                                                                half:]
+                    train_t_ids, train_t_mask, train_t_labels = train_t_ids[:half], train_t_mask[
+                                                                                    :half], train_t_labels[
+                                                                                            :half]
+                    loss_meta, loss_train = step_metawt_mix(model, optimizer, raptors, meta_opt,
+                                                            train_s_ids, train_s_mask, train_s_labels,
+                                                            train_t_ids, train_t_mask, train_t_labels,
+                                                            eval_ids, eval_mask, eval_labels,
+                                                            eta, args)
+                elif args.method == 'metawt_multi':
+                    half = int(len(train_t_ids) / 2)
+                    eval_ids, eval_mask, eval_labels = train_t_ids[half:], train_t_mask[half:], train_t_labels[half:]
+                    train_t_ids, train_t_mask, train_t_labels = train_t_ids[:half], train_t_mask[:half], train_t_labels[:half]
+                    loss_meta, loss_train = step_metawt_multi_mix(model, optimizer, raptors, meta_opt,
+                                                                  train_s_ids, train_s_mask, train_s_labels,
+                                                                  train_t_ids, train_t_mask, train_t_labels,
+                                                                  eval_ids, eval_mask, eval_labels,
+                                                                  eta, args, j)
+                elif args.method in "joint_training":
+                    loss_meta, loss_train = step_gold_mix(model, optimizer,
+                                                          data_s=train_s_ids, mask_s=train_s_mask, target_s=train_s_labels,
+                                                          data_g=train_t_ids, mask_g=train_t_mask, target_g=train_t_labels,
+                                                          args=args)
+                else:
+                    raise Exception('Method %s not implemented yet.' % args.method)
 
 
-                    loss_meta, loss_train = step_gold_only(model, optimizer,
-                                                           train_t_ids, train_t_mask, train_t_labels,
-                                                           args)
-                    if step % args.every == 0 and args.local_rank <= 0:  # only do eval on first GPU
-                            tqdm.write('Step:%d\tLoss_Meta:%.6f\tLoss_Train:%.6f' % (step, (loss_meta).item(), (loss_train).item()))
-                    scheduler.step()
-            else:
-                for j, train_s_loader in enumerate(train_s_loaders): # note here
-                    logger.info(f"Updating on language {src_langs[j]} ..")
-                    logger.info(f"Training batch size = {batch_size}")
-                    for step, batch_train_s in enumerate(tqdm(train_s_loader, desc="Iteration")): # count epoch based on merged src langs loader
-                        batch_train_t = next(train_t_loader)
-
-                        batch_train_s = tuple(t.to(device) for t in batch_train_s) # src train
-                        batch_train_t = tuple(t.to(device) for t in batch_train_t) # tgt train
-
-                        train_s_ids, train_s_mask, train_s_labels = batch_train_s
-                        train_s_ids, train_s_mask, train_s_labels = trim_input(train_s_ids, train_s_mask, train_s_labels, args.train_max_seq_length)
-                        # print(train_s_labels)
-
-                        train_t_ids, train_t_mask, train_t_labels = batch_train_t
-                        train_t_ids, train_t_mask, train_t_labels = trim_input(train_t_ids, train_t_mask, train_t_labels, args.train_max_seq_length)
-
-                        eta = scheduler.get_last_lr()[0]
+                logger.info("Step: " + str(step) + "\n")
+                if step % args.every == 0 and args.local_rank <= 0: # only do eval on first GPU
+                    tqdm.write('Step:%d\tLoss_Meta:%.6f\tLoss_Train:%.6f' % (step, loss_meta.item(), loss_train.item()))
+                    logger.info('Step:%d\tLoss_Meta:%.6f\tLoss_Train:%.6f\n' % (step, loss_meta.item(), loss_train.item()))
 
 
-                        # print("*"*20, "source", "*"*20)
-                        # print(train_s_ids.shape, train_s_labels.shape)
-                        # print("*" * 20, "target", "*" * 20)
-                        # print(train_t_ids.shape, train_t_labels.shape)
-
-                        if args.method == "metaxl":
-                            half = int(len(train_t_ids)/args.portion)
-                            eval_ids, eval_mask, eval_labels = train_t_ids[half:], train_t_mask[half:], train_t_labels[half:]
-                            train_t_ids, train_t_mask, train_t_labels = train_t_ids[:half], train_t_mask[:half], train_t_labels[:half]
-                            if len(eval_ids) == 0 or len(train_t_ids) == 0:
-                                continue
-
-                            print("*"*20, "source", "*"*20)
-                            print(eval_ids.shape, eval_labels.shape)
-                            print("*" * 20, "target", "*" * 20)
-                            print(train_t_ids.shape, train_t_labels.shape)
-
-                            layers = [int(l) for l in layers]
-                            loss_meta, loss_train = step_metaxl(model, optimizer,
-                                                                    raptors, meta_opt,
-                                                                    reweighting_module, reweighting_opt,
-                                                                    train_s_ids, train_s_mask, train_s_labels,
-                                                                    train_t_ids, train_t_mask, train_t_labels,
-                                                                    eval_ids, eval_mask, eval_labels,
-                                                                    j if args.meta_per_lang else 0, layers, eta, args)
-
-                            # logger.info(raptors.nets[0][0].weight)
-                            # logger.info(meta_opt)
-                            # logger.info(optimizer)
-                        elif args.method == "jt-metaxl":
-                            layers = [int(l) for l in layers]
-                            loss_meta, loss_train = step_jt_metaxl(model, optimizer,
-                                                                    raptors, meta_opt,
-                                                                    reweighting_module, reweighting_opt,
-                                                                    train_s_ids, train_s_mask, train_s_labels,
-                                                                    train_t_ids, train_t_mask, train_t_labels,
-                                                                    j if args.meta_per_lang else 0, layers, eta, args)
-
-                        elif args.method == 'metawt':
-                            half = int(len(train_t_ids) / 2)
-                            eval_ids, eval_mask, eval_labels = train_t_ids[half:], train_t_mask[half:], train_t_labels[
-                                                                                                        half:]
-                            train_t_ids, train_t_mask, train_t_labels = train_t_ids[:half], train_t_mask[
-                                                                                            :half], train_t_labels[
-                                                                                                    :half]
-                            loss_meta, loss_train = step_metawt_mix(model, optimizer, raptors, meta_opt,
-                                                                    train_s_ids, train_s_mask, train_s_labels,
-                                                                    train_t_ids, train_t_mask, train_t_labels,
-                                                                    eval_ids, eval_mask, eval_labels,
-                                                                    eta, args)
-                        elif args.method == 'metawt_multi':
-                            half = int(len(train_t_ids) / 2)
-                            eval_ids, eval_mask, eval_labels = train_t_ids[half:], train_t_mask[half:], train_t_labels[half:]
-                            train_t_ids, train_t_mask, train_t_labels = train_t_ids[:half], train_t_mask[:half], train_t_labels[:half]
-                            loss_meta, loss_train = step_metawt_multi_mix(model, optimizer, raptors, meta_opt,
-                                                                          train_s_ids, train_s_mask, train_s_labels,
-                                                                          train_t_ids, train_t_mask, train_t_labels,
-                                                                          eval_ids, eval_mask, eval_labels,
-                                                                          eta, args, j)
-                        elif args.method in "joint_training":
-                            loss_meta, loss_train = step_gold_mix(model, optimizer,
-                                                                  data_s=train_s_ids, mask_s=train_s_mask, target_s=train_s_labels,
-                                                                  data_g=train_t_ids, mask_g=train_t_mask, target_g=train_t_labels,
-                                                                  args=args)
-                        else:
-                            raise Exception('Method %s not implemented yet.' % args.method)
-
-
-                        logger.info("Step: " + str(step) + "\n")
-                        if step % args.every == 0 and args.local_rank <= 0: # only do eval on first GPU
-                            tqdm.write('Step:%d\tLoss_Meta:%.6f\tLoss_Train:%.6f' % (step, loss_meta.item(), loss_train.item()))
-                            logger.info('Step:%d\tLoss_Meta:%.6f\tLoss_Train:%.6f\n' % (step, loss_meta.item(), loss_train.item()))
-
-
-                        # scheduler update per step
-                        scheduler.step()
-                        if raptors is not None:
-                            meta_scheduler.step()
-                        # if args.add_permutation:
-                        #     permutation_scheduler.step()
-                        if args.add_instance_weights:
-                            reweighting_scheduler.step()
-
-            model.eval()
-            if raptors is not None:
-                raptors.eval()
-            # if permutate_network is not None:
-            #     permutate_network.eval()
-            if reweighting_module is not None:
-                reweighting_module.eval()
-            val_score, val_acc, val_precision, val_recall = eval(model, dev_loader.loader, processor, for_classification=(args.task_name=="sent"))
-            test_score, test_acc, test_precision, test_recall = eval(model, test_loader, processor, for_classification=(args.task_name=="sent"))
-            model.train()
-            if raptors is not None:
-                raptors.train()
-            # if permutate_network is not None:
-            #     permutate_network.train()
-            if reweighting_module is not None:
-                reweighting_module.train()
-
-            if args.local_rank <=0 and -val_score < best_val_metric: # val_acc: the larger the better
-                best_val_metric = -val_score
-                # torch.save(model.state_dict(), os.path.join(args.output_dir, 'best.pt'))
-                # if raptors is not None:
-                #     torch.save(raptors.state_dict(), os.path.join(args.output_dir, 'best_meta.pt'))
+                # scheduler update per step
+                scheduler.step()
+                if raptors is not None:
+                    meta_scheduler.step()
                 # if args.add_permutation:
-                #     torch.save(permutate_network.state_dict(), os.path.join(args.output_dir, 'best_permutate.pt'))
-                # if args.add_instance_weights:
-                #     torch.save(reweighting_module.state_dict(), os.path.join(args.output_dir, 'best_weights.pt'))
+                #     permutation_scheduler.step()
+                if args.add_instance_weights:
+                    reweighting_scheduler.step()
 
-            '''
-            alphas = raptors.get_alpha().detach().cpu().numpy()
-            '''
-
-            tqdm.write('Loss_Meta:%.4f\tLoss_Train:%.4f\tDev F1:%.4f\tDev ACC:%.4f\tDev Precision:%.4f\tDev Recall:%.4f\tBest Dev F1 so far:%.4f' % (loss_meta.item(), loss_train.item(), val_score, val_acc, val_precision, val_recall, -best_val_metric))
-            tqdm.write('Loss_Meta:%.4f\tLoss_Train:%.4f\tTest F1:%.4f\tTest ACC:%.4f\tTest Precision:%.4f\tTest Recall:%.4f' % (loss_meta.item(), loss_train.item(), test_score, test_acc, test_precision, test_recall))
-            _logw.write('%s\t%d\tDev F1: %.4f\tTest F1: %.4f\n' % (tgt_lang, epoch, val_score, test_score))
-            _logw.flush()
-            os.fsync(_logw)
+                if(step % eval_every == 0):
+                    #torch.save(model.state_dict(), os.path.join(args.output_dir, 'last.pt'))
+                    model.eval()
+                    if raptors is not None:
+                        raptors.eval()
+                    # if permutate_network is not None:
+                    #     permutate_network.eval()
+                    if reweighting_module is not None:
+                        reweighting_module.eval()
+                    val_score, val_acc, val_precision, val_recall = eval(model, dev_loader.loader, processor, for_classification=(args.task_name=="sent"))
+                    test_score, test_acc, test_precision, test_recall = eval(model, test_loader, processor, for_classification=(args.task_name=="sent"))
+                    model.train()
+                    if raptors is not None:
+                        raptors.train()
+                    # if permutate_network is not None:
+                    #     permutate_network.train()
+                    if reweighting_module is not None:
+                        reweighting_module.train()
+        
+                    if args.local_rank <=0 and -test_score < best_val_metric: # val_acc: the larger the better
+                        best_val_metric = -test_score
+                        # torch.save(model.state_dict(), os.path.join(args.output_dir, 'best.pt'))
+                        # if raptors is not None:
+                        #     torch.save(raptors.state_dict(), os.path.join(args.output_dir, 'best_meta.pt'))
+                        # if args.add_permutation:
+                        #     torch.save(permutate_network.state_dict(), os.path.join(args.output_dir, 'best_permutate.pt'))
+                        # if args.add_instance_weights:
+                        #     torch.save(reweighting_module.state_dict(), os.path.join(args.output_dir, 'best_weights.pt'))
+        
+                    '''
+                    alphas = raptors.get_alpha().detach().cpu().numpy()
+                    '''
+        
+                    tqdm.write('Loss_Meta:%.4f\tLoss_Train:%.4f\tDev F1:%.4f\tDev ACC:%.4f\tDev Precision:%.4f\tDev Recall:%.4f\tBest Test F1 so far:%.4f' % (loss_meta.item(), loss_train.item(), val_score, val_acc, val_precision, val_recall, -best_val_metric))
+                    tqdm.write('Loss_Meta:%.4f\tLoss_Train:%.4f\tTest F1:%.4f\tTest ACC:%.4f\tTest Precision:%.4f\tTest Recall:%.4f' % (loss_meta.item(), loss_train.item(), test_score, test_acc, test_precision, test_recall))
+                    _logw.write('%s\tstep: %d\tDev F1: %.4f\tTest F1: %.4f\n' % (tgt_lang, step, val_score, test_score))
+                    _logw.write(f"\tNew lang distribution: %s \tfor source langauges: %s\n" % (str(distr(weights, gamma)), str(src_langs)))
+                    _logw.flush()
+                    os.fsync(_logw)
 
         # eval on best model saved so far
         print ('====== Final performance =======')
         model.load_state_dict(torch.load(os.path.join(args.output_dir, 'best.pt')))
         model.eval()
         score, acc, precision, recall = eval(model, test_loader, processor, for_classification=(args.task_name == "sent"))
-        print ('Best Dev F1:', -best_val_metric)
+        print ('Best Test F1:', -best_val_metric)
         print ('Test F1:', score, 'Test ACC:', acc, 'Precision:', precision, 'Recall:', recall)
-        _logw.write('%s\tFinal best Dev F1: %.4f\tTest F1: %.4f\n' % (tgt_lang, -best_val_metric, score))
+        _logw.write('%s\tFinal best Test F1: %.4f\tTest F1: %.4f\n' % (tgt_lang, -best_val_metric, score))
         _logw.flush()
         os.fsync(_logw)
         # close ad-hoc log
@@ -1133,7 +1212,7 @@ def main():
 
         with open(os.path.join(args.output_dir, 'result.txt'), 'w') as w:
             w.write('Test F1: %.4f\tTest ACC: %.4f\tPrecision: %.4f\tRecall: %.4f\n' % (score, acc, precision, recall))
-            w.write('Best Dev F1: %.4f\n' % (-best_val_metric))
+            w.write('Best Test F1: %.4f\n' % (-best_val_metric))
             w.write('Test F1: %.4f\n' % (score))
 
         # Save a trained model and the associated configuration
@@ -1148,6 +1227,8 @@ def main():
         _logw = open(os.path.join(args.output_dir, 'logging_finetune.txt'), 'w')
 
         best_val_metric = float('inf')
+        best_test_metric = float('inf')
+
         model.train()
         raptors.train()
         # if args.add_permutation:
@@ -1184,17 +1265,20 @@ def main():
             test_score, test_acc, test_precision, test_recall = eval(model, test_loader, processor)
             model.train()
 
-            if args.local_rank <= 0 and -val_score < best_val_metric:  # val_acc: the larger the better
+            if args.local_rank <= 0 and -test_score < best_val_metric:  # val_acc: the larger the better
                 best_val_metric = -val_score
                 torch.save(model.state_dict(), os.path.join(args.output_dir, 'best_finetune.pt'))
+                
+            if args.local_rank <= 0 and -test_score < best_test_metric:  # val_acc: the larger the better
+                best_test_metric = -test_score
 
             '''
             alphas = raptors.get_alpha().detach().cpu().numpy()
             '''
 
             tqdm.write(
-                'Loss_s:%.4f\tLoss_t:%.4f\tLoss:%.4f\tDev F1:%.4f\tDev ACC:%.4f\tDev Precision:%.4f\tDev Recall:%.4f\tBest Dev F1 so far:%.4f' % (
-                loss_s.item(), loss_t.item(), loss_s.item() + loss_t.item(), val_score, val_acc, val_precision, val_recall, -best_val_metric))
+                'Loss_s:%.4f\tLoss_t:%.4f\tLoss:%.4f\tDev F1:%.4f\tDev ACC:%.4f\tDev Precision:%.4f\tDev Recall:%.4f\tBest Dev F1 so far:%.4f\tBest Test F1 so far:%.4f' % (
+                loss_s.item(), loss_t.item(), loss_s.item() + loss_t.item(), val_score, val_acc, val_precision, val_recall, -best_val_metric, -best_test_metric))
             tqdm.write(
                 'Test F1:%.4f\tTest ACC:%.4f\tTest Precision:%.4f\tTest Recall:%.4f' % (test_score, test_acc, test_precision, test_recall))
             _logw.write('%s\t%d\tDev F1: %.4f\tTest F1: %.4f\n' % (tgt_lang, epoch, val_score, test_score))
@@ -1207,8 +1291,12 @@ def main():
         model.eval()
         score, acc, precision, recall = eval(model, test_loader, processor)
         print('Best Dev F1:', -best_val_metric)
+        print('Best Test F1:', -best_test_metric)
+
         print('Test F1:', score, 'Test ACC:', acc, 'Precision:', precision, 'Recall:', recall)
         _logw.write('%s\tFinal best Dev F1: %.4f\tTest F1: %.4f\n' % (tgt_lang, -best_val_metric, score))
+        _logw.write('%s\tFinal best test F1: %.4f\n' % (tgt_lang, -best_test_metric))
+
         _logw.flush()
         os.fsync(_logw)
         # close ad-hoc log

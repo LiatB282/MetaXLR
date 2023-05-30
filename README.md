@@ -1,4 +1,4 @@
-## MetaXLR - Mixed Language Meta Representation Transformation for Low-resource Cross-lingual Learning based on Multi-Armed Bandit
+## MetaXLR - Mixed Language Meta Representation Transformation for Low-resource Cross-lingual Learning based on Multi-Armed Bandit 🐙
 
 We base our code on MetaXL, published at NAACL 2021. 
 > [MetaXL: Meta Representation Transformation for Low- resource Cross-lingual Learning] (https://arxiv.org/pdf/2104.07908.pdf)
